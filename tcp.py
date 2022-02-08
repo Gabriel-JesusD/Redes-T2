@@ -1,4 +1,5 @@
 import asyncio
+from time import time
 from grader.tcputils import FLAGS_ACK, FLAGS_FIN, FLAGS_SYN, fix_checksum, make_header
 from tcputils import *
 
@@ -63,6 +64,12 @@ class Conexao:
         self.ack_client = ack_no
         self.seq_client = ack_no
         self.sent_data = {}
+        self.SampleRTT = 0
+        self.DevRTT = 0
+        self.EstimatedRTT = 0
+        self.TimeoutInterval = 1
+        self.SentTime = 0
+        self.reenvio = False
         self.open = True
         self.timer = None  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
         #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
@@ -70,6 +77,7 @@ class Conexao:
     def _exemplo_timer(self):
         # Esta função é só um exemplo e pode ser removida
         print(f'tamo reenviando o bang {list(self.sent_data.keys())[0]} do bereguejohnson de tamanho {len(self.sent_data)}, e {self.sent_data.keys()}')
+        self.reenvio = True
         self.enviar(self.sent_data[list(self.sent_data.keys())[0]])
 
         print('Este é um exemplo de como fazer um timer')
@@ -82,23 +90,35 @@ class Conexao:
         # print('recebido payload: %r' % payload)
         print(f'veio pra ca {len(self.sent_data)} and {self.sent_data.keys()}')
         if len(self.sent_data):
+            if not self.reenvio:
+                first = 0 == self.SampleRTT
+                self.SampleRTT = time() - self.SentTime
+                if first:
+                    self.EstimatedRTT = self.SampleRTT
+                    self.DevRTT = self.SampleRTT/2
+                else:
+                    self.EstimatedRTT = (0.875)*self.EstimatedRTT + 0.125*self.SampleRTT
+                    self.DevRTT = (0.75)*self.DevRTT + 0.25* abs(self.SampleRTT - self.EstimatedRTT)
+                self.TimeoutInterval = self.EstimatedRTT + 4*self.DevRTT
             if ack_no > list(self.sent_data.keys())[0]:
                 del self.sent_data[list(self.sent_data.keys())[0]]
                 if len(self.sent_data):
-                    self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)
+                    self.timer = asyncio.get_event_loop().call_later(self.TimeoutInterval, self._exemplo_timer)
                 else:
                     self.timer.cancel()
 
+        self.reenvio = False or not True #ser ou não ser
+
         print(f'seq_no = {seq_no}, self.ack_no = {self.ack_no}, ack_no = {ack_no}, self.seq_no = {self.seq_no}')
         if seq_no != self.ack_no or (not len(payload) and (flags & FLAGS_FIN) != FLAGS_FIN) or not self.open: return
-        print('ENTREI AQUI EM ALGUM MOMENTO, ack_no, seq_no, pay', ack_no, seq_no, len(payload))
+        # print('ENTREI AQUI EM ALGUM MOMENTO, ack_no, seq_no, pay', ack_no, seq_no, len(payload))
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
         self.seq_no = self.ack_no
         self.ack_no += len(payload) 
         if (flags & FLAGS_FIN) == FLAGS_FIN:
             self.ack_no += 1
         self.ack_client = self.ack_no
-        print('SAI DAQUI EM ALGUM MOMENTO, ack_no, seq_no', self.ack_no, self.seq_no)
+        # print('SAI DAQUI EM ALGUM MOMENTO, ack_no, seq_no', self.ack_no, self.seq_no)
         self.callback(self, payload) 
         flags = FLAGS_ACK
         newSegment = fix_checksum(make_header(dst_port, src_port, self.seq_no, self.ack_no, flags), src_addr, dst_addr)
@@ -140,7 +160,7 @@ class Conexao:
             flags = FLAGS_ACK
             # self._rdt_rcv(self.seq_no, self.ack_no, flags, payload)
             # seq_no = self.ack_client
-            print(f'APOS ITERACAO, ack = {self.ack_no}, seq = {self.seq_client}')
+            # print(f'APOS ITERACAO, ack = {self.ack_no}, seq = {self.seq_client}')
             self.sent_data[self.seq_client] = payload 
             newSegment = fix_checksum(make_header(dst_port, src_port, self.seq_client, self.ack_no, flags) + payload, src_addr, dst_addr)
             self.servidor.rede.enviar(newSegment,src_addr)
@@ -148,9 +168,10 @@ class Conexao:
             # seq_no = self.ack_client
             # print(f'pld = {len(payload)} sq = {self.seq_no}')
             i += MSS
+        self.SentTime = time()
         if(self.timer is not None):
             self.timer.cancel()
-        self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)
+        self.timer = asyncio.get_event_loop().call_later(self.TimeoutInterval, self._exemplo_timer)
         # self.ack_no += len(dados)
         print(f'SAINDO DO LOOP, ack = {self.ack_no}, seq = {self.seq_client}')
         # self.ack_no = self.seq_no
