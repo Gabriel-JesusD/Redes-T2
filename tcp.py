@@ -1,6 +1,6 @@
 import asyncio
 from time import time
-from grader.tcputils import FLAGS_ACK, FLAGS_FIN, FLAGS_SYN, fix_checksum, make_header
+from grader.tcputils import FLAGS_ACK, FLAGS_FIN, FLAGS_SYN, MSS, fix_checksum, make_header
 from tcputils import *
 
 
@@ -64,11 +64,14 @@ class Conexao:
         self.ack_client = ack_no
         self.seq_client = ack_no
         self.sent_data = {}
+        self.segments = {}
         self.SampleRTT = 0
         self.DevRTT = 0
         self.EstimatedRTT = 0
         self.TimeoutInterval = 1
         self.SentTime = 0
+        self.cwnd = MSS
+        self.rcv_cwnd = 0
         self.reenvio = False
         self.open = True
         self.timer = None  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
@@ -76,11 +79,11 @@ class Conexao:
 
     def _exemplo_timer(self):
         # Esta função é só um exemplo e pode ser removida
-        print(f'tamo reenviando o bang {list(self.sent_data.keys())[0]} do bereguejohnson de tamanho {len(self.sent_data)}, e {self.sent_data.keys()}')
         self.reenvio = True
+        self.cwnd = ((self.cwnd/MSS)//2)*MSS
         self.enviar(self.sent_data[list(self.sent_data.keys())[0]])
 
-        print('Este é um exemplo de como fazer um timer')
+        # print('Este é um exemplo de como fazer um timer')
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
@@ -88,7 +91,6 @@ class Conexao:
         # garantir que eles não sejam duplicados e que tenham sido recebidos em
         # ordem.
         # print('recebido payload: %r' % payload)
-        print(f'veio pra ca {len(self.sent_data)} and {self.sent_data.keys()}')
         if len(self.sent_data):
             if not self.reenvio:
                 first = 0 == self.SampleRTT
@@ -100,16 +102,34 @@ class Conexao:
                     self.EstimatedRTT = (0.875)*self.EstimatedRTT + 0.125*self.SampleRTT
                     self.DevRTT = (0.75)*self.DevRTT + 0.25* abs(self.SampleRTT - self.EstimatedRTT)
                 self.TimeoutInterval = self.EstimatedRTT + 4*self.DevRTT
+                
             if ack_no > list(self.sent_data.keys())[0]:
-                del self.sent_data[list(self.sent_data.keys())[0]]
+                y = list(self.sent_data.keys())[0]
+                while y < ack_no:
+                    self.rcv_cwnd += len(self.segments[y]) 
+                    del self.segments[y]
+                    del self.sent_data[y]
+                    if 0 == len(self.sent_data):
+                        break
+                    y = list(self.sent_data.keys())[0]
+                    
                 if len(self.sent_data):
+                    if(self.timer is not None):
+                        self.timer.cancel()
                     self.timer = asyncio.get_event_loop().call_later(self.TimeoutInterval, self._exemplo_timer)
                 else:
                     self.timer.cancel()
+                if self.rcv_cwnd >= self.cwnd or 0 == len(self.sent_data):
+                    self.cwnd += MSS
+                    self.rcv_cwnd = 0
+                    if len(self.sent_data):
+                        if(self.timer is not None):
+                            self.timer.cancel()
+                        self.timer = asyncio.get_event_loop().call_later(self.TimeoutInterval, self._exemplo_timer)
+                        self.enviar(self.sent_data[list(self.sent_data.keys())[0]])
 
         self.reenvio = False or not True #ser ou não ser
 
-        print(f'seq_no = {seq_no}, self.ack_no = {self.ack_no}, ack_no = {ack_no}, self.seq_no = {self.seq_no}')
         if seq_no != self.ack_no or (not len(payload) and (flags & FLAGS_FIN) != FLAGS_FIN) or not self.open: return
         # print('ENTREI AQUI EM ALGUM MOMENTO, ack_no, seq_no, pay', ack_no, seq_no, len(payload))
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
@@ -146,34 +166,53 @@ class Conexao:
         # TODO: implemente aqui o envio de dados.
         # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o
         # segmento
-        if len(self.sent_data):
-            for key,value in self.sent_data.items():
-                if(value == dados):
-                    self.seq_client = key
+        # if len(self.sent_data):
+        #     for key,value in self.sent_data.items():
+        #         if(value == dados):
+        #             self.seq_client = key
 
         i = 0
         src_addr, src_port, dst_addr, dst_port = self.id_conexao
-        print(f'TAMANHO DOS DADOS = {len(dados)}, SEQ_NO = {self.seq_client}, ACK_NO = {self.ack_no}, ACK_CLIENTE = {self.ack_client}')
         # seq_no = 
-        while i < len(dados):
-            payload = dados[i:i+MSS]
-            flags = FLAGS_ACK
-            # self._rdt_rcv(self.seq_no, self.ack_no, flags, payload)
-            # seq_no = self.ack_client
-            # print(f'APOS ITERACAO, ack = {self.ack_no}, seq = {self.seq_client}')
-            self.sent_data[self.seq_client] = payload 
-            newSegment = fix_checksum(make_header(dst_port, src_port, self.seq_client, self.ack_no, flags) + payload, src_addr, dst_addr)
-            self.servidor.rede.enviar(newSegment,src_addr)
-            self.seq_client += len(payload)
-            # seq_no = self.ack_client
-            # print(f'pld = {len(payload)} sq = {self.seq_no}')
-            i += MSS
+
+        if 0 == len(self.sent_data):
+            while i < len(dados):
+                payload = dados[i:i+MSS]
+                flags = FLAGS_ACK
+                # self._rdt_rcv(self.seq_no, self.ack_no, flags, payload)
+                # seq_no = self.ack_client
+                # print(f'APOS ITERACAO, ack = {self.ack_no}, seq = {self.seq_client}')
+                self.sent_data[self.seq_client] = payload 
+                newSegment = fix_checksum(make_header(dst_port, src_port, self.seq_client, self.ack_no, flags) + payload, src_addr, dst_addr)
+                # self.servidor.rede.enviar(newSegment,src_addr)
+                self.segments[self.seq_client] = newSegment
+                self.seq_client += len(payload)
+                # seq_no = self.ack_client
+                # print(f'pld = {len(payload)} sq = {self.seq_no}')
+                i += MSS
+        cont = 0
+        # print(self.sent_data.keys(), 'HEREEEEEEEEEEEEEEEE')
+        if not self.reenvio:
+            for j in self.sent_data.keys():
+                # self.seq_client = j
+                if(cont >= self.cwnd):
+                    break
+                self.servidor.rede.enviar(self.segments[j],src_addr)
+                cont += len(self.segments[j])
+        else:
+            y = list(self.sent_data.keys())[0]
+            self.servidor.rede.enviar(self.segments[y],src_addr)
+        
         self.SentTime = time()
         if(self.timer is not None):
             self.timer.cancel()
         self.timer = asyncio.get_event_loop().call_later(self.TimeoutInterval, self._exemplo_timer)
+            
+                
+
+           
+        
         # self.ack_no += len(dados)
-        print(f'SAINDO DO LOOP, ack = {self.ack_no}, seq = {self.seq_client}')
         # self.ack_no = self.seq_no
         # que você construir para a camada de rede.
 
